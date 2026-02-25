@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  claudeclaw:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./store:/app/store
+      - ./workspace:/app/workspace
+      - ~/.claude:/root/.claude:ro
+    environment:
+      - NODE_ENV=production
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
