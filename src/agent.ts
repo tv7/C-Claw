@@ -1,7 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { fileURLToPath } from 'url'
 import path from 'path'
-import { readEnvFile } from './env.js'
 import { logger } from './logger.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -12,62 +11,63 @@ export interface AgentResult {
   newSessionId?: string
 }
 
-/**
- * Run the Claude Code agent with session resumption.
- * bypassPermissions is required for unattended bot operation.
- */
 export async function runAgent(
   message: string,
   sessionId?: string,
   onTyping?: () => void
 ): Promise<AgentResult> {
-  const env = readEnvFile()
-
-  let resultText: string | null = null
+  let text: string | null = null
   let newSessionId: string | undefined
-
-  // Typing indicator refresh
   let typingInterval: ReturnType<typeof setInterval> | null = null
+
   if (onTyping) {
-    typingInterval = setInterval(onTyping, 4000)
+    onTyping()
+    typingInterval = setInterval(() => {
+      onTyping()
+    }, 4000)
   }
 
   try {
-    const agentOptions: Parameters<typeof query>[0] = {
-      prompt: message,
-      options: {
-        cwd: PROJECT_ROOT,
-        permissionMode: 'bypassPermissions',
-        settingSources: ['project', 'user'],
-      },
+    const options: Record<string, unknown> = {
+      cwd: PROJECT_ROOT,
+      permissionMode: 'bypassPermissions',
+      settingSources: ['project', 'user'],
     }
 
     if (sessionId) {
-      (agentOptions.options as Record<string, unknown>).resume = sessionId
+      options.resume = sessionId
     }
 
-    const stream = query(agentOptions)
+    const stream = query({
+      prompt: message,
+      options,
+    })
 
     for await (const event of stream) {
-      if (event.type === 'system' && (event as Record<string, unknown>).subtype === 'init') {
-        const initEvent = event as Record<string, unknown>
+      if (
+        event.type === 'system' &&
+        (event as { type: string; subtype?: string; session_id?: string }).subtype === 'init'
+      ) {
+        const initEvent = event as { type: string; subtype: string; session_id?: string }
         if (initEvent.session_id) {
-          newSessionId = initEvent.session_id as string
+          newSessionId = initEvent.session_id
+          logger.debug({ sessionId: newSessionId }, 'agent session initialized')
         }
-      }
-      if (event.type === 'result') {
-        const resultEvent = event as Record<string, unknown>
-        if (resultEvent.result) {
-          resultText = String(resultEvent.result)
+      } else if (event.type === 'result') {
+        const resultEvent = event as { type: string; result?: string }
+        if (resultEvent.result != null) {
+          text = resultEvent.result
         }
       }
     }
   } catch (err) {
-    logger.error({ err }, 'runAgent error')
+    logger.error({ err }, 'agent query failed')
     throw err
   } finally {
-    if (typingInterval) clearInterval(typingInterval)
+    if (typingInterval !== null) {
+      clearInterval(typingInterval)
+    }
   }
 
-  return { text: resultText, newSessionId }
+  return { text, newSessionId }
 }

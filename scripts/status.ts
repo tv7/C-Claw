@@ -1,161 +1,186 @@
 #!/usr/bin/env tsx
-/**
- * ClaudeClaw Status Checker
- * Run: npm run status
- */
-import { execSync, spawnSync } from 'child_process'
-import https from 'https'
-import { existsSync, readFileSync } from 'fs'
+import { execSync } from 'child_process'
+import { existsSync } from 'fs'
 import { fileURLToPath } from 'url'
 import path from 'path'
+import { readEnvFile } from '../src/env.js'
+import https from 'https'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(__dirname, '..')
 
-const C = {
-  reset: '\x1b[0m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  red: '\x1b[31m',
-  cyan: '\x1b[36m',
-  bold: '\x1b[1m',
+const env = readEnvFile()
+
+const GREEN = '\x1b[32m'
+const YELLOW = '\x1b[33m'
+const RED = '\x1b[31m'
+const RESET = '\x1b[0m'
+const BOLD = '\x1b[1m'
+
+function ok(msg: string) {
+  console.log(`${GREEN}✓${RESET} ${msg}`)
 }
 
-const ok = (label: string, detail = '') => console.log(`${C.green}✓${C.reset} ${label}${detail ? ` — ${C.cyan}${detail}${C.reset}` : ''}`)
-const warn = (label: string, detail = '') => console.log(`${C.yellow}⚠${C.reset} ${label}${detail ? ` — ${detail}` : ''}`)
-const fail = (label: string, detail = '') => console.log(`${C.red}✗${C.reset} ${label}${detail ? ` — ${detail}` : ''}`)
+function warn(msg: string) {
+  console.log(`${YELLOW}⚠${RESET} ${msg}`)
+}
 
-function readEnv(): Record<string, string> {
-  const envPath = path.join(PROJECT_ROOT, '.env')
-  if (!existsSync(envPath)) return {}
-  const result: Record<string, string> = {}
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const eqIdx = trimmed.indexOf('=')
-    if (eqIdx === -1) continue
-    const key = trimmed.slice(0, eqIdx).trim()
-    let value = trimmed.slice(eqIdx + 1).trim()
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1)
-    }
-    result[key] = value
+function fail(msg: string) {
+  console.log(`${RED}✗${RESET} ${msg}`)
+}
+
+function header(msg: string) {
+  console.log(`\n${BOLD}${msg}${RESET}`)
+}
+
+function tryExec(cmd: string): string | null {
+  try {
+    return execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim()
+  } catch {
+    return null
   }
-  return result
 }
 
-async function checkTelegramToken(token: string): Promise<boolean> {
-  return new Promise(resolve => {
-    https.get(`https://api.telegram.org/bot${token}/getMe`, (res) => {
-      let data = ''
-      res.on('data', (c: Buffer) => { data += c.toString() })
+// ---------------------------------------------------------------------------
+// Node.js version
+// ---------------------------------------------------------------------------
+
+header('Node.js')
+const nodeVersion = process.version
+const major = parseInt(nodeVersion.replace('v', '').split('.')[0], 10)
+if (major >= 22) {
+  ok(`Node ${nodeVersion}`)
+} else if (major >= 20) {
+  warn(`Node ${nodeVersion} (>=22.5.0 recommended for built-in sqlite)`)
+} else {
+  fail(`Node ${nodeVersion} — requires >=20`)
+}
+
+// ---------------------------------------------------------------------------
+// Claude CLI
+// ---------------------------------------------------------------------------
+
+header('Claude CLI')
+const claudeVersion = tryExec('claude --version')
+if (claudeVersion) {
+  ok(`claude ${claudeVersion}`)
+} else {
+  fail('claude CLI not found — install from https://claude.ai/code')
+}
+
+// ---------------------------------------------------------------------------
+// Telegram
+// ---------------------------------------------------------------------------
+
+header('Telegram')
+const botToken = env['TELEGRAM_BOT_TOKEN'] ?? ''
+const chatId = env['ALLOWED_CHAT_ID'] ?? env['ALLOWED_CHAT_IDS']?.split(',')[0] ?? ''
+
+if (!botToken) {
+  fail('TELEGRAM_BOT_TOKEN not set')
+} else {
+  // Validate token via getMe
+  const result = await new Promise<boolean>(resolve => {
+    https.get(`https://api.telegram.org/bot${botToken}/getMe`, res => {
+      const chunks: Buffer[] = []
+      res.on('data', (c: Buffer) => chunks.push(c))
       res.on('end', () => {
         try {
-          const parsed = JSON.parse(data) as { ok: boolean; result?: { username: string } }
-          if (parsed.ok) {
-            ok('Telegram bot token', `@${parsed.result?.username}`)
-            resolve(true)
-          } else {
-            fail('Telegram bot token', 'invalid')
-            resolve(false)
-          }
+          const body = JSON.parse(Buffer.concat(chunks).toString()) as { ok: boolean; result?: { username?: string } }
+          resolve(body.ok)
         } catch {
-          fail('Telegram bot token', 'could not parse response')
           resolve(false)
         }
       })
-    }).on('error', (e: Error) => {
-      fail('Telegram bot token', e.message)
-      resolve(false)
-    })
+    }).on('error', () => resolve(false))
   })
+
+  if (result) {
+    ok(`Bot token valid`)
+  } else {
+    fail(`Bot token invalid or unreachable`)
+  }
 }
 
-async function main(): Promise<void> {
-  console.log(`\n${C.bold}ClaudeClaw Status${C.reset}\n`)
-
-  // Node version
-  const [major] = process.versions.node.split('.').map(Number)
-  if (major >= 20) ok('Node.js', process.versions.node)
-  else fail('Node.js', `${process.versions.node} (need >=20)`)
-
-  // Claude CLI
-  const claudeResult = spawnSync('claude', ['--version'], { encoding: 'utf-8' })
-  if (claudeResult.status === 0) ok('claude CLI', claudeResult.stdout.trim())
-  else fail('claude CLI', 'not found — install from https://claude.ai/code')
-
-  // .env
-  const envPath = path.join(PROJECT_ROOT, '.env')
-  if (existsSync(envPath)) ok('.env file', envPath)
-  else fail('.env file', 'not found — run npm run setup')
-
-  const env = readEnv()
-
-  // Telegram token
-  const token = env['TELEGRAM_BOT_TOKEN'] ?? ''
-  if (token) {
-    await checkTelegramToken(token)
-  } else {
-    fail('Telegram bot token', 'not configured')
-  }
-
-  // Chat ID
-  const chatId = env['ALLOWED_CHAT_ID'] ?? ''
-  if (chatId) ok('Chat ID', chatId)
-  else warn('Chat ID', 'not set — send /chatid to your bot')
-
-  // Voice
-  const groqKey = env['GROQ_API_KEY'] ?? ''
-  if (groqKey) ok('Groq STT', 'configured')
-  else warn('Groq STT', 'not configured (optional)')
-
-  const elKey = env['ELEVENLABS_API_KEY'] ?? ''
-  const elVoice = env['ELEVENLABS_VOICE_ID'] ?? ''
-  if (elKey && elVoice) ok('ElevenLabs TTS', 'configured')
-  else warn('ElevenLabs TTS', 'not configured (optional)')
-
-  // Video
-  const googleKey = env['GOOGLE_API_KEY'] ?? ''
-  if (googleKey) ok('Google Gemini', 'configured')
-  else warn('Google Gemini', 'not configured (optional)')
-
-  // Database
-  const dbPath = path.join(PROJECT_ROOT, 'store', 'claudeclaw.db')
-  if (existsSync(dbPath)) {
-    ok('SQLite database', dbPath)
-  } else {
-    warn('SQLite database', 'not found — will be created on first start')
-  }
-
-  // Dist build
-  const distIndex = path.join(PROJECT_ROOT, 'dist', 'index.js')
-  if (existsSync(distIndex)) ok('Build', 'dist/index.js exists')
-  else warn('Build', 'not built — run npm run build')
-
-  // Service status
-  console.log()
-  if (process.platform === 'darwin') {
-    try {
-      const r = execSync('launchctl list com.claudeclaw.app 2>/dev/null', { encoding: 'utf-8' })
-      if (r.trim()) ok('macOS service', 'running (launchd)')
-      else warn('macOS service', 'not loaded')
-    } catch {
-      warn('macOS service', 'not installed')
-    }
-  } else if (process.platform === 'linux') {
-    try {
-      const r = execSync('systemctl --user is-active claudeclaw.service 2>/dev/null', { encoding: 'utf-8' })
-      if (r.trim() === 'active') ok('systemd service', 'active')
-      else warn('systemd service', r.trim())
-    } catch {
-      warn('systemd service', 'not installed')
-    }
-  }
-
-  console.log()
+if (chatId) {
+  ok(`Chat ID configured: ${chatId}`)
+} else {
+  warn('ALLOWED_CHAT_ID not set — bot will accept messages from any chat')
 }
 
-main().catch(err => {
-  console.error(err)
-  process.exit(1)
-})
+// ---------------------------------------------------------------------------
+// Voice
+// ---------------------------------------------------------------------------
+
+header('Voice')
+const groqKey = env['GROQ_API_KEY'] ?? ''
+const elKey = env['ELEVENLABS_API_KEY'] ?? ''
+const elVoice = env['ELEVENLABS_VOICE_ID'] ?? ''
+
+if (groqKey) {
+  ok('Groq STT configured')
+} else {
+  warn('GROQ_API_KEY not set — voice transcription disabled')
+}
+
+if (elKey && elVoice) {
+  ok('ElevenLabs TTS configured')
+} else if (elKey) {
+  warn('ELEVENLABS_API_KEY set but ELEVENLABS_VOICE_ID missing')
+} else {
+  warn('ElevenLabs not configured — voice replies disabled')
+}
+
+// ---------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------
+
+header('Database')
+const dbPath = path.join(PROJECT_ROOT, 'store', 'claudeclaw.db')
+if (existsSync(dbPath)) {
+  ok(`Database exists at ${dbPath}`)
+  try {
+    const { initDatabase, getMemoriesForChat, getAllTasks } = await import('../src/db.js')
+    initDatabase()
+    const mems = getMemoriesForChat('*', 1000)
+    const tasks = getAllTasks()
+    ok(`Memories: ${mems.length}`)
+    ok(`Scheduled tasks: ${tasks.length}`)
+  } catch (err) {
+    warn(`Could not query DB: ${err}`)
+  }
+} else {
+  warn(`Database not found — will be created on first start`)
+}
+
+// ---------------------------------------------------------------------------
+// Background service
+// ---------------------------------------------------------------------------
+
+header('Background Service')
+const platform = process.platform
+
+if (platform === 'darwin') {
+  const plistPath = path.join(process.env.HOME ?? '', 'Library', 'LaunchAgents', 'com.claudeclaw.app.plist')
+  if (existsSync(plistPath)) {
+    const status = tryExec('launchctl list com.claudeclaw.app')
+    if (status && !status.includes('not found')) {
+      ok('launchd service registered and running')
+    } else {
+      warn('launchd plist exists but service may not be loaded')
+    }
+  } else {
+    warn('launchd plist not found — run npm run setup to install')
+  }
+} else if (platform === 'linux') {
+  const status = tryExec('systemctl --user is-active claudeclaw')
+  if (status === 'active') {
+    ok('systemd service active')
+  } else {
+    warn(`systemd service status: ${status ?? 'not found'} — run npm run setup to install`)
+  }
+} else {
+  warn('Windows — use PM2: pm2 list')
+}
+
+console.log()

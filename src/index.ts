@@ -1,150 +1,125 @@
-import {
-  readFileSync,
-  writeFileSync,
-  existsSync,
-  mkdirSync,
-  unlinkSync,
-} from "fs";
-import { fileURLToPath } from "url";
-import path from "path";
-import { initDatabase } from "./db.js";
-import { createBot, sendMessage } from "./bot.js";
-import { runDecaySweep } from "./memory.js";
-import { initScheduler, stopScheduler } from "./scheduler.js";
-import { cleanupOldUploads } from "./media.js";
-import { logger } from "./logger.js";
-import { PROJECT_ROOT, STORE_DIR, TELEGRAM_BOT_TOKEN } from "./config.js";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from 'fs'
+import { fileURLToPath } from 'url'
+import path from 'path'
+import { logger } from './logger.js'
+import { TELEGRAM_BOT_TOKEN, STORE_DIR } from './config.js'
+import { initDatabase } from './db.js'
+import { runDecaySweep } from './memory.js'
+import { cleanupOldUploads } from './media.js'
+import { createBot, sendMessage } from './bot.js'
+import { initScheduler, stopScheduler } from './scheduler.js'
 
-// ── Banner ────────────────────────────────────────────────────────────────────
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const PID_FILE = path.join(STORE_DIR, 'claudeclaw.pid')
 
-function showBanner(): void {
-  try {
-    const banner = readFileSync(path.join(PROJECT_ROOT, "banner.txt"), "utf-8");
-    console.log(banner);
-  } catch {
-    console.log("ClaudeClaw — Starting up...");
-  }
-}
-
-// ── PID lock ──────────────────────────────────────────────────────────────────
-
-const PID_FILE = path.join(STORE_DIR, "claudeclaw.pid");
+// ---------------------------------------------------------------------------
+// Lock file
+// ---------------------------------------------------------------------------
 
 function acquireLock(): void {
-  mkdirSync(STORE_DIR, { recursive: true });
+  mkdirSync(STORE_DIR, { recursive: true })
+
   if (existsSync(PID_FILE)) {
-    const rawPid = readFileSync(PID_FILE, "utf-8").trim();
-    const oldPid = parseInt(rawPid, 10);
-    if (!isNaN(oldPid)) {
+    const existing = readFileSync(PID_FILE, 'utf8').trim()
+    const pid = Number(existing)
+
+    if (!isNaN(pid) && pid > 0) {
       try {
-        process.kill(oldPid, 0); // Check if process exists
-        logger.info({ oldPid }, "Killing existing ClaudeClaw process");
-        process.kill(oldPid, "SIGTERM");
+        process.kill(pid, 0) // throws if not alive
+        logger.info({ pid }, 'Killing stale instance')
+        process.kill(pid, 'SIGTERM')
       } catch {
-        // Process doesn't exist — stale PID file
+        // Process not alive — stale PID file, safe to overwrite
       }
     }
   }
-  writeFileSync(PID_FILE, String(process.pid), "utf-8");
-  logger.debug({ pid: process.pid }, "PID lock acquired");
+
+  writeFileSync(PID_FILE, String(process.pid), 'utf8')
 }
 
 function releaseLock(): void {
   try {
     if (existsSync(PID_FILE)) {
-      const stored = readFileSync(PID_FILE, "utf-8").trim();
-      if (stored === String(process.pid)) {
-        unlinkSync(PID_FILE);
-      }
+      unlinkSync(PID_FILE)
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to release lock file')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Banner
+// ---------------------------------------------------------------------------
+
+function showBanner(): void {
+  try {
+    const bannerPath = path.resolve(__dirname, '..', 'banner.txt')
+    if (existsSync(bannerPath)) {
+      console.log(readFileSync(bannerPath, 'utf8'))
+    } else {
+      console.log('=== ClaudeClaw ===')
     }
   } catch {
-    // ignore
+    console.log('=== ClaudeClaw ===')
   }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  showBanner();
+  showBanner()
 
   if (!TELEGRAM_BOT_TOKEN) {
-    console.error("ERROR: TELEGRAM_BOT_TOKEN not set.");
-    console.error("Run `npm run setup` to configure, or set it in .env");
-    process.exit(1);
+    logger.error('TELEGRAM_BOT_TOKEN is not set. Run npm run setup or add it to .env.')
+    process.exit(1)
   }
 
-  acquireLock();
+  acquireLock()
 
-  // Initialize database
-  initDatabase();
-  logger.info("Database initialized");
+  initDatabase()
+  logger.info('Database initialized')
 
-  // Run memory decay sweep (and schedule daily)
-  runDecaySweep();
-  setInterval(runDecaySweep, 24 * 60 * 60 * 1000);
+  runDecaySweep()
+  setInterval(runDecaySweep, 24 * 60 * 60 * 1000)
 
-  // Cleanup old uploads
-  cleanupOldUploads();
+  cleanupOldUploads()
 
-  // Create bot
-  let bot: Awaited<ReturnType<typeof createBot>>;
-  try {
-    bot = createBot();
-  } catch (err) {
-    logger.error({ err }, "Failed to create bot");
-    process.exit(1);
+  const bot = createBot()
+
+  const sender = async (chatId: string, text: string): Promise<void> => {
+    await sendMessage(bot, chatId, text)
   }
 
-  // Initialize scheduler
-  const sender = (chatId: string, text: string) =>
-    sendMessage(bot, chatId, text);
-  initScheduler(sender);
+  initScheduler(sender)
 
-  // Graceful shutdown
-  const shutdown = async (signal: string) => {
-    logger.info({ signal }, "Shutting down...");
-    stopScheduler();
-    try {
-      await bot.stop();
-    } catch {
-      // ignore
-    }
-    // releaseLock handled by unlinkSync inline to avoid require() in ESM
-    try {
-      if (existsSync(PID_FILE)) {
-        const { unlinkSync } = await import("fs");
-        unlinkSync(PID_FILE);
-      }
-    } catch {
-      // ignore
-    }
-    logger.info("Shutdown complete");
-    process.exit(0);
-  };
+  const shutdown = async () => {
+    logger.info('Shutting down...')
+    stopScheduler()
+    releaseLock()
+    await bot.stop()
+    process.exit(0)
+  }
 
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.once('SIGINT', () => { shutdown().catch(() => process.exit(1)) })
+  process.once('SIGTERM', () => { shutdown().catch(() => process.exit(1)) })
 
-  // Start the bot
-  logger.info("ClaudeClaw starting...");
+  logger.info('Starting Telegram bot...')
+
   try {
     await bot.start({
-      onStart: (info) => {
-        logger.info({ botUsername: info.username }, "ClaudeClaw running");
-        console.log(`\nClaudeClaw is running as @${info.username}`);
-        console.log("Send a message on Telegram to start.\n");
-      },
-    });
+      onStart: () => logger.info('ClaudeClaw running'),
+    })
   } catch (err) {
-    logger.error({ err }, "Bot start error");
-    if (String(err).includes("401")) {
-      console.error("\nInvalid TELEGRAM_BOT_TOKEN. Check your .env file.");
-    }
-    process.exit(1);
+    logger.error({ err }, 'Bot failed to start')
+    releaseLock()
+    process.exit(1)
   }
 }
 
-main().catch((err) => {
-  logger.error({ err }, "Fatal error");
-  process.exit(1);
-});
+main().catch(err => {
+  logger.error({ err }, 'Fatal error')
+  releaseLock()
+  process.exit(1)
+})

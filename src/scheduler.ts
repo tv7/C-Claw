@@ -1,58 +1,76 @@
-import { CronExpression, parseExpression } from 'cron-parser'
-import { getDueTasks, updateTaskAfterRun } from './db.js'
-import { runAgent } from './agent.js'
-import { logger } from './logger.js'
+import { parseExpression } from "cron-parser";
+import {
+  getDueTasks,
+  updateTaskAfterRun,
+  getAllTasks,
+  ScheduledTask,
+} from "./db.js";
+import { runAgent } from "./agent.js";
+import { logger } from "./logger.js";
 
-export type Sender = (chatId: string, text: string) => Promise<void>
+export type Sender = (chatId: string, text: string) => Promise<void>;
 
-let schedulerInterval: ReturnType<typeof setInterval> | null = null
+let intervalHandle: ReturnType<typeof setInterval> | null = null;
 
-/**
- * Compute the Unix timestamp (seconds) for the next cron occurrence.
- */
-export function computeNextRun(cronExpression: string): number {
-  const parsed = parseExpression(cronExpression)
-  return Math.floor(parsed.next().getTime() / 1000)
+export function computeNextRun(cronExpr: string): number {
+  return Math.floor(parseExpression(cronExpr).next().getTime() / 1000);
 }
 
-/**
- * Run all due scheduled tasks.
- */
 export async function runDueTasks(send: Sender): Promise<void> {
-  const tasks = getDueTasks()
+  const now = Math.floor(Date.now() / 1000);
+  const tasks = getDueTasks(now);
+
   for (const task of tasks) {
-    logger.info({ taskId: task.id, prompt: task.prompt.slice(0, 50) }, 'Running scheduled task')
+    logger.info(
+      { taskId: task.id, chatId: task.chat_id },
+      "Running scheduled task",
+    );
+
     try {
-      await send(task.chat_id, `Running scheduled task: "${task.prompt.slice(0, 80)}..."`)
-      const result = await runAgent(task.prompt)
-      const text = result.text ?? '(no response)'
-      await send(task.chat_id, `Scheduled task result:\n\n${text}`)
-      const nextRun = computeNextRun(task.schedule)
-      updateTaskAfterRun(task.id, text, nextRun)
+      await send(task.chat_id, `Running: "${task.prompt.slice(0, 80)}..."`);
+
+      const agentResult = await runAgent(task.prompt);
+      const resultText = agentResult.text ?? "";
+
+      await send(task.chat_id, resultText);
+
+      const lastRun = Math.floor(Date.now() / 1000);
+      const nextRun = computeNextRun(task.schedule);
+
+      updateTaskAfterRun(task.id, lastRun, nextRun, resultText.slice(0, 500));
+
+      logger.info({ taskId: task.id, nextRun }, "Scheduled task completed");
     } catch (err) {
-      logger.error({ err, taskId: task.id }, 'Scheduled task failed')
-      await send(task.chat_id, `Scheduled task failed: ${String(err)}`)
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error({ taskId: task.id, err: errMsg }, "Scheduled task failed");
+
+      try {
+        await send(task.chat_id, `Task failed: ${errMsg}`);
+      } catch {
+        // best effort
+      }
+
+      const lastRun = Math.floor(Date.now() / 1000);
+      const nextRun = computeNextRun(task.schedule);
+      updateTaskAfterRun(task.id, lastRun, nextRun, `ERROR: ${errMsg}`);
     }
   }
 }
 
-/**
- * Initialize the scheduler polling loop.
- */
 export function initScheduler(send: Sender): void {
-  if (schedulerInterval) return
-  logger.info('Scheduler started (60s poll)')
-  schedulerInterval = setInterval(() => {
-    runDueTasks(send).catch(err => logger.error({ err }, 'Scheduler poll error'))
-  }, 60_000)
+  intervalHandle = setInterval(() => {
+    runDueTasks(send).catch((err) => {
+      logger.error({ err }, "runDueTasks error");
+    });
+  }, 60_000);
+
+  logger.info("Scheduler started (60s poll)");
 }
 
-/**
- * Stop the scheduler.
- */
 export function stopScheduler(): void {
-  if (schedulerInterval) {
-    clearInterval(schedulerInterval)
-    schedulerInterval = null
+  if (intervalHandle !== null) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+    logger.info("Scheduler stopped");
   }
 }

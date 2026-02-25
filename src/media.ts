@@ -1,132 +1,121 @@
-import https from 'https'
-import http from 'http'
-import { createWriteStream, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs'
+import { mkdirSync, existsSync, readdirSync, statSync, unlinkSync } from 'fs'
 import { fileURLToPath } from 'url'
 import path from 'path'
+import https from 'https'
+import { TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY } from './config.js'
 import { logger } from './logger.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PROJECT_ROOT = path.resolve(__dirname, '..')
-
+export const PROJECT_ROOT = path.resolve(__dirname, '..')
 export const UPLOADS_DIR = path.join(PROJECT_ROOT, 'workspace', 'uploads')
+
 mkdirSync(UPLOADS_DIR, { recursive: true })
 
-/**
- * Sanitize a filename: keep only safe characters.
- */
-function sanitizeFilename(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-')
+function httpsGet(url: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const request = (targetUrl: string) => {
+      https.get(targetUrl, res => {
+        if (
+          res.statusCode !== undefined &&
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location
+        ) {
+          request(res.headers.location)
+          return
+        }
+
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer) => chunks.push(chunk))
+        res.on('end', () => resolve(Buffer.concat(chunks)))
+        res.on('error', reject)
+      }).on('error', reject)
+    }
+    request(url)
+  })
 }
 
-/**
- * Download a Telegram file by fileId.
- * Returns the local path where it was saved.
- */
 export async function downloadMedia(
-  botToken: string,
   fileId: string,
   originalFilename?: string
 ): Promise<string> {
-  // Get file path from Telegram
-  const fileMeta = await new Promise<{ result: { file_path: string } }>((resolve, reject) => {
-    const url = `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`
-    https.get(url, (res) => {
-      let data = ''
-      res.on('data', (chunk: Buffer) => { data += chunk.toString() })
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data) as { result: { file_path: string } })
-        } catch (e) {
-          reject(e)
-        }
-      })
-    }).on('error', reject)
-  })
+  // Step 1: Get file info from Telegram
+  const getFileUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
+  const infoBuffer = await httpsGet(getFileUrl)
+  const infoJson = JSON.parse(infoBuffer.toString('utf8')) as {
+    ok: boolean
+    result?: { file_path?: string }
+  }
 
-  const tgFilePath = fileMeta.result.file_path
-  const ext = path.extname(tgFilePath) || path.extname(originalFilename ?? '') || ''
-  const baseName = originalFilename
-    ? sanitizeFilename(path.basename(originalFilename, ext))
-    : 'media'
-  const localFilename = `${Date.now()}_${baseName}${ext}`
-  const localPath = path.join(UPLOADS_DIR, localFilename)
+  if (!infoJson.ok || !infoJson.result?.file_path) {
+    throw new Error(`Telegram getFile failed for file_id=${fileId}: ${infoBuffer.toString('utf8')}`)
+  }
 
-  // Download the file
-  await new Promise<void>((resolve, reject) => {
-    const downloadUrl = `https://api.telegram.org/file/bot${botToken}/${tgFilePath}`
-    https.get(downloadUrl, (res) => {
-      const ws = createWriteStream(localPath)
-      res.pipe(ws)
-      ws.on('finish', resolve)
-      ws.on('error', reject)
-    }).on('error', reject)
-  })
+  const filePath = infoJson.result.file_path
 
-  logger.debug({ localPath }, 'Media downloaded')
+  // Step 2: Download the actual file
+  const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
+  const fileBuffer = await httpsGet(downloadUrl)
+
+  // Step 3: Sanitize filename
+  const rawName = originalFilename ?? path.basename(filePath)
+  const sanitized = rawName.replace(/[^a-zA-Z0-9._-]/g, '-')
+  const localPath = path.join(UPLOADS_DIR, `${Date.now()}_${sanitized}`)
+
+  // Step 4: Write to disk
+  const { writeFileSync } = await import('fs')
+  writeFileSync(localPath, fileBuffer)
+
+  logger.debug({ fileId, localPath }, 'media downloaded')
+
   return localPath
 }
 
-/**
- * Build a prompt message for a photo.
- */
 export function buildPhotoMessage(localPath: string, caption?: string): string {
-  const parts = [
-    `I've sent you a photo. The file is at: ${localPath}`,
-    'Please analyze this image and describe what you see.',
-  ]
-  if (caption) parts.push(`Caption: ${caption}`)
-  return parts.join('\n')
+  const captionPart = caption ? `Caption: ${caption}` : ''
+  return `I've received a photo at ${localPath}. ${captionPart} Please analyze it.`.trim()
 }
 
-/**
- * Build a prompt message for a document.
- */
-export function buildDocumentMessage(localPath: string, filename: string, caption?: string): string {
-  const parts = [
-    `I've sent you a document. File: ${filename}`,
-    `Local path: ${localPath}`,
-    'Please read and analyze this document.',
-  ]
-  if (caption) parts.push(`Caption: ${caption}`)
-  return parts.join('\n')
+export function buildDocumentMessage(
+  localPath: string,
+  filename: string,
+  caption?: string
+): string {
+  const captionPart = caption ? `Caption: ${caption}` : ''
+  return `I've received a document '${filename}' at ${localPath}. ${captionPart} Please read and analyze it.`.trim()
 }
 
-/**
- * Build a prompt message for a video.
- * Instructs Claude to use Gemini API for video analysis.
- */
 export function buildVideoMessage(localPath: string, caption?: string): string {
-  const parts = [
-    `I've sent you a video. The file is at: ${localPath}`,
-    'Please analyze this video using the Gemini API (GOOGLE_API_KEY is in .env).',
-    'Describe what you see and any relevant details.',
-  ]
-  if (caption) parts.push(`Caption: ${caption}`)
-  return parts.join('\n')
+  const captionPart = caption ? ` Caption: ${caption}.` : ''
+  return (
+    `I've received a video at ${localPath}.${captionPart} ` +
+    `Please analyze it using the Gemini API. ` +
+    `The GOOGLE_API_KEY is available in the .env file at ${PROJECT_ROOT}/.env. ` +
+    `Use the Google Generative AI SDK (or REST API) with the gemini-2.0-flash model. ` +
+    `Upload the video file, then ask Gemini to describe and summarize the content.`
+  )
 }
 
-/**
- * Delete uploads older than maxAgeMs (default 24h).
- */
-export function cleanupOldUploads(maxAgeMs = 24 * 60 * 60 * 1000): void {
-  try {
-    const now = Date.now()
-    const files = readdirSync(UPLOADS_DIR)
-    let cleaned = 0
-    for (const file of files) {
-      const fp = path.join(UPLOADS_DIR, file)
-      try {
-        const stat = statSync(fp)
-        if (now - stat.mtimeMs > maxAgeMs) {
-          unlinkSync(fp)
-          cleaned++
-        }
-      } catch {
-        // ignore individual file errors
+export function cleanupOldUploads(maxAgeMs = 86400000): void {
+  if (!existsSync(UPLOADS_DIR)) return
+
+  const now = Date.now()
+  let deleted = 0
+
+  for (const entry of readdirSync(UPLOADS_DIR)) {
+    const fullPath = path.join(UPLOADS_DIR, entry)
+    try {
+      const stat = statSync(fullPath)
+      if (now - stat.mtimeMs > maxAgeMs) {
+        unlinkSync(fullPath)
+        deleted++
       }
+    } catch (err) {
+      logger.warn({ err, fullPath }, 'failed to stat or delete upload during cleanup')
     }
-    if (cleaned > 0) logger.info({ cleaned }, 'Cleaned up old uploads')
-  } catch (err) {
-    logger.warn({ err }, 'cleanupOldUploads error')
+  }
+
+  if (deleted > 0) {
+    logger.info({ deleted }, 'cleaned up old uploads')
   }
 }

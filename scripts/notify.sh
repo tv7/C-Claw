@@ -1,39 +1,55 @@
 #!/usr/bin/env bash
-# notify.sh — send a Telegram message from shell (for progress updates from Claude)
-# Usage: ./scripts/notify.sh "Your message here"
+# Send a Telegram message from the shell.
+# Usage: ./scripts/notify.sh "your message here"
+# Reads TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID from .env
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/.env"
 
 if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Error: .env not found at $PROJECT_ROOT/.env" >&2
+  echo "Error: .env file not found at $PROJECT_ROOT/.env" >&2
   exit 1
 fi
 
-# Parse .env
-while IFS='=' read -r key value; do
-  [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-  value="${value%\"}"
-  value="${value#\"}"
-  value="${value%\'}"
-  value="${value#\'}"
-  export "$key=$value"
+BOT_TOKEN=""
+CHAT_ID=""
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ "$line" =~ ^# ]] && continue
+  [[ -z "$line" ]] && continue
+
+  key="${line%%=*}"
+  val="${line#*=}"
+  val="${val#\"}" ; val="${val%\"}"
+  val="${val#\'}" ; val="${val%\'}"
+
+  case "$key" in
+    TELEGRAM_BOT_TOKEN) BOT_TOKEN="$val" ;;
+    ALLOWED_CHAT_ID)    CHAT_ID="$val" ;;
+    ALLOWED_CHAT_IDS)
+      if [[ -z "$CHAT_ID" ]]; then
+        CHAT_ID="${val%%,*}"
+      fi
+      ;;
+  esac
 done < "$ENV_FILE"
 
-BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-CHAT_ID="${ALLOWED_CHAT_ID:-}"
-MESSAGE="${1:-}"
-
-if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
-  echo "Error: TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID must be set in .env" >&2
+if [[ -z "$BOT_TOKEN" ]]; then
+  echo "Error: TELEGRAM_BOT_TOKEN not found in .env" >&2
   exit 1
 fi
 
+if [[ -z "$CHAT_ID" ]]; then
+  echo "Error: ALLOWED_CHAT_ID not found in .env" >&2
+  exit 1
+fi
+
+MESSAGE="${1:-}"
 if [[ -z "$MESSAGE" ]]; then
-  echo "Usage: $0 \"Your message\"" >&2
+  echo "Usage: $0 \"your message\"" >&2
   exit 1
 fi
 
@@ -41,7 +57,6 @@ curl -s -X POST \
   "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
   -d "chat_id=${CHAT_ID}" \
   --data-urlencode "text=${MESSAGE}" \
-  -d "parse_mode=HTML" \
   > /dev/null
 
-echo "Message sent."
+echo "Sent: $MESSAGE"

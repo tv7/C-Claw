@@ -1,7 +1,7 @@
 {
   "name": "claudeclaw",
-  "version": "1.0.0",
-  "description": "Personal AI assistant — Claude Code on your phone via Telegram",
+  "version": "2.0.0",
+  "description": "Your Claude Code, in your pocket. A personal AI agent bridge via Telegram.",
   "type": "module",
   "scripts": {
     "build": "tsc",
@@ -10,7 +10,8 @@
     "setup": "tsx scripts/setup.ts",
     "status": "tsx scripts/status.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "schedule": "node dist/schedule-cli.js"
   },
   "engines": {
     "node": ">=22.5.0"
@@ -18,9 +19,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
     "cron-parser": "^4.9.0",
-    "discord.js": "^14.14.1",
     "grammy": "^1.21.1",
-    "openai": "^4.28.0",
     "pino": "^8.19.0",
     "pino-pretty": "^11.0.0",
     "qrcode-terminal": "^0.12.0",

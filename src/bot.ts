@@ -1,400 +1,612 @@
-import { Bot, Context, InputFile } from 'grammy'
-import { writeFileSync } from 'fs'
-import path from 'path'
-import { TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_IDS, MAX_MESSAGE_LENGTH, TYPING_REFRESH_MS } from './config.js'
-import { getSession, setSession, clearSession, getMemoriesForChat } from './db.js'
-import { runAgent } from './agent.js'
-import { buildMemoryContext, saveConversationTurn, runDecaySweep } from './memory.js'
-import { transcribeAudio, synthesizeSpeech, voiceCapabilities } from './voice.js'
-import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js'
-import { UPLOADS_DIR } from './media.js'
-import { logger } from './logger.js'
+import { Bot, Context, InputFile } from "grammy";
+import { writeFileSync } from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import {
+  TELEGRAM_BOT_TOKEN,
+  ALLOWED_CHAT_IDS,
+  MAX_MESSAGE_LENGTH,
+  TYPING_REFRESH_MS,
+  GROQ_API_KEY,
+  ELEVENLABS_API_KEY,
+  MULTIUSER,
+} from "./config.js";
+import {
+  getSession,
+  setSession,
+  clearSession,
+  getMemoriesForChat,
+  getAllTasks,
+  createTask,
+  deleteTask,
+  setTaskStatus,
+} from "./db.js";
+import { runAgent } from "./agent.js";
+import { buildMemoryContext, saveConversationTurn } from "./memory.js";
+import {
+  transcribeAudio,
+  synthesizeSpeech,
+  voiceCapabilities,
+} from "./voice.js";
+import {
+  downloadMedia,
+  buildPhotoMessage,
+  buildDocumentMessage,
+  buildVideoMessage,
+  UPLOADS_DIR,
+} from "./media.js";
+import { computeNextRun } from "./scheduler.js";
+import { logger } from "./logger.js";
+import { randomUUID } from "crypto";
 
-// In-memory set of chat IDs with voice reply enabled
-const voiceModeChats = new Set<string>()
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ── Auth ─────────────────────────────────────────────────────────────────────
+const voiceModeChats = new Set<string>();
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
 
 export function isAuthorised(chatId: number | string): boolean {
-  const id = String(chatId)
-  if (ALLOWED_CHAT_IDS.length === 0) return true // first-run mode
-  return ALLOWED_CHAT_IDS.includes(id)
+  if (ALLOWED_CHAT_IDS.length === 0) return true;
+  return ALLOWED_CHAT_IDS.includes(String(chatId));
 }
 
-// ── Markdown → Telegram HTML ──────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
 
-/**
- * Convert Claude's Markdown output to Telegram-compatible HTML.
- * Telegram only supports: <b>, <i>, <code>, <pre>, <s>, <a>, <u>
- */
 export function formatForTelegram(text: string): string {
-  // Extract and protect code blocks
-  const codeBlocks: string[] = []
-  let result = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_match, lang, code) => {
-    const idx = codeBlocks.length
-    const escaped = code
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-    codeBlocks.push(lang ? `<pre><code class="language-${lang}">${escaped}</code></pre>` : `<pre>${escaped}</pre>`)
-    return `\x00CODE${idx}\x00`
-  })
+  const codeBlocks: string[] = [];
+  const inlineCodes: string[] = [];
 
-  // Protect inline code
-  const inlineCodes: string[] = []
-  result = result.replace(/`([^`]+)`/g, (_match, code) => {
-    const idx = inlineCodes.length
-    const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    inlineCodes.push(`<code>${escaped}</code>`)
-    return `\x00INLINE${idx}\x00`
-  })
+  // Extract fenced code blocks
+  let result = text.replace(/```[\s\S]*?```/g, (match) => {
+    const idx = codeBlocks.length;
+    const lang = match.match(/^```(\w+)?/)?.[1] ?? "";
+    const content = match.replace(/^```\w*\n?/, "").replace(/```$/, "");
+    const escaped = content
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    codeBlocks.push(
+      `<pre${lang ? ` language="${lang}"` : ""}><code>${escaped}</code></pre>`,
+    );
+    return `\x00CODE${idx}\x00`;
+  });
 
-  // Escape HTML special chars in remaining text
+  // Extract inline code
+  result = result.replace(/`[^`]+`/g, (match) => {
+    const idx = inlineCodes.length;
+    const content = match.slice(1, -1);
+    const escaped = content
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    inlineCodes.push(`<code>${escaped}</code>`);
+    return `\x00INLINE${idx}\x00`;
+  });
+
+  // Escape HTML entities in remaining text
   result = result
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 
-  // Headings → bold
-  result = result.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>')
+  // Headings: # Heading or ## Heading etc.
+  result = result.replace(
+    /^#{1,6}\s+(.+)$/gm,
+    (_, heading) => `<b>${heading}</b>`,
+  );
 
-  // Bold: **text** or __text__
-  result = result.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
-  result = result.replace(/__(.+?)__/g, '<b>$1</b>')
+  // Bold: **text**
+  result = result.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
 
-  // Italic: *text* or _text_
-  result = result.replace(/\*([^*\n]+?)\*/g, '<i>$1</i>')
-  result = result.replace(/_([^_\n]+?)_/g, '<i>$1</i>')
+  // Italic: *text* (not preceded/followed by *)
+  result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
 
   // Strikethrough: ~~text~~
-  result = result.replace(/~~(.+?)~~/g, '<s>$1</s>')
+  result = result.replace(/~~(.+?)~~/g, "<s>$1</s>");
 
   // Links: [text](url)
-  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
 
   // Checkboxes
-  result = result.replace(/^- \[x\]/gmi, '☑')
-  result = result.replace(/^- \[ \]/gmi, '☐')
+  result = result.replace(/^- \[ \]/gm, "☐");
+  result = result.replace(/^- \[x\]/gim, "☑");
 
-  // Strip horizontal rules and triple-star bold/italic
-  result = result.replace(/^---+$/gm, '')
-  result = result.replace(/^\*\*\*+$/gm, '')
+  // Strip horizontal rules
+  result = result.replace(/^---+$/gm, "");
+  result = result.replace(/^\*\*\*+$/gm, "");
 
   // Restore inline codes
-  result = result.replace(/\x00INLINE(\d+)\x00/g, (_m, i) => inlineCodes[Number(i)])
+  result = result.replace(
+    /\x00INLINE(\d+)\x00/g,
+    (_, i) => inlineCodes[Number(i)],
+  );
 
   // Restore code blocks
-  result = result.replace(/\x00CODE(\d+)\x00/g, (_m, i) => codeBlocks[Number(i)])
+  result = result.replace(
+    /\x00CODE(\d+)\x00/g,
+    (_, i) => codeBlocks[Number(i)],
+  );
 
-  return result.trim()
+  return result.trim();
 }
 
-/**
- * Split a message on newlines, keeping chunks ≤ limit chars.
- */
-export function splitMessage(text: string, limit = MAX_MESSAGE_LENGTH): string[] {
-  if (text.length <= limit) return [text]
-  const lines = text.split('\n')
-  const chunks: string[] = []
-  let current = ''
+// ---------------------------------------------------------------------------
+// Message splitting
+// ---------------------------------------------------------------------------
+
+export function splitMessage(
+  text: string,
+  limit = MAX_MESSAGE_LENGTH,
+): string[] {
+  if (text.length <= limit) return [text];
+
+  const chunks: string[] = [];
+  const lines = text.split("\n");
+  let current = "";
+
   for (const line of lines) {
-    const addition = current ? `\n${line}` : line
-    if ((current + addition).length > limit) {
-      if (current) chunks.push(current)
-      // If a single line exceeds limit, hard split
-      if (line.length > limit) {
-        for (let i = 0; i < line.length; i += limit) {
-          chunks.push(line.slice(i, i + limit))
-        }
-        current = ''
-      } else {
-        current = line
+    // Line itself exceeds limit -- hard split
+    if (line.length > limit) {
+      if (current.length > 0) {
+        chunks.push(current);
+        current = "";
       }
+      let remaining = line;
+      while (remaining.length > limit) {
+        chunks.push(remaining.slice(0, limit));
+        remaining = remaining.slice(limit);
+      }
+      current = remaining;
+      continue;
+    }
+
+    const candidate = current.length === 0 ? line : current + "\n" + line;
+
+    if (candidate.length > limit) {
+      chunks.push(current);
+      current = line;
     } else {
-      current += addition
+      current = candidate;
     }
   }
-  if (current) chunks.push(current)
-  return chunks
+
+  if (current.length > 0) chunks.push(current);
+
+  return chunks;
 }
 
-// ── Core handler ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Commands helpers
+// ---------------------------------------------------------------------------
 
-async function handleMessage(
+const COMMANDS_LIST = `Commands:
+/start -- greeting
+/help -- show this list
+/chatid -- show your chat ID
+/newchat or /forget -- clear session
+/memory -- show saved memories
+/voice -- toggle voice replies
+/schedule list -- list scheduled tasks
+/schedule create <cron> <prompt...> -- schedule a task
+/schedule delete <id> -- delete a task
+/schedule pause <id> -- pause a task
+/schedule resume <id> -- resume a task`;
+
+// ---------------------------------------------------------------------------
+// handleMessage
+// ---------------------------------------------------------------------------
+
+export async function handleMessage(
   ctx: Context,
   rawText: string,
-  forceVoiceReply = false
+  forceVoiceReply = false,
 ): Promise<void> {
-  const chatId = String(ctx.chat?.id)
-  if (!chatId || !isAuthorised(chatId)) {
-    await ctx.reply('Unauthorised.')
-    return
+  const chatId = String(ctx.chat?.id ?? "");
+
+  if (!isAuthorised(chatId)) {
+    await ctx.reply("Not authorised.");
+    return;
   }
 
-  // Build memory context
-  const memCtx = await buildMemoryContext(chatId, rawText)
-  const fullMessage = memCtx ? `${memCtx}\n\n${rawText}` : rawText
+  const memoryContext = await buildMemoryContext(chatId, rawText);
+  const fullMessage = memoryContext
+    ? `${memoryContext}\n\n${rawText}`
+    : rawText;
 
-  // Get existing session
-  const sessionId = getSession(chatId)
+  const existingSessionId = getSession(chatId);
 
-  // Start typing indicator
-  let typingActive = true
-  const sendTyping = () => {
-    if (typingActive) {
-      ctx.api.sendChatAction(Number(chatId), 'typing').catch(() => {})
+  let typingInterval: ReturnType<typeof setInterval> | null = null;
+
+  const sendTyping = async () => {
+    try {
+      await ctx.api.sendChatAction(Number(chatId), "typing");
+    } catch {
+      // ignore
     }
-  }
-  sendTyping()
-  const typingInterval = setInterval(sendTyping, TYPING_REFRESH_MS)
+  };
+
+  await sendTyping();
+  typingInterval = setInterval(() => {
+    sendTyping().catch(() => {});
+  }, TYPING_REFRESH_MS);
+
+  let resultText: string;
+  let newSessionId: string | undefined;
 
   try {
-    const result = await runAgent(fullMessage, sessionId, sendTyping)
-    typingActive = false
-    clearInterval(typingInterval)
-
-    // Persist session
-    if (result.newSessionId) {
-      setSession(chatId, result.newSessionId)
+    const agentResult = await runAgent(
+      fullMessage,
+      existingSessionId ?? undefined,
+      sendTyping,
+    );
+    resultText = agentResult.text ?? "";
+    newSessionId = agentResult.newSessionId;
+  } finally {
+    if (typingInterval !== null) {
+      clearInterval(typingInterval);
+      typingInterval = null;
     }
-
-    const responseText = result.text ?? '(no response)'
-
-    // Save conversation turn to memory
-    await saveConversationTurn(chatId, rawText, responseText)
-
-    // Voice mode: TTS reply
-    const caps = voiceCapabilities()
-    const useVoice = caps.tts && (forceVoiceReply || voiceModeChats.has(chatId))
-    if (useVoice) {
-      try {
-        const mp3 = await synthesizeSpeech(responseText.slice(0, 2000))
-        const tmpPath = path.join(UPLOADS_DIR, `tts_${Date.now()}.mp3`)
-        writeFileSync(tmpPath, mp3)
-        await ctx.replyWithAudio(new InputFile(tmpPath))
-        return
-      } catch (err) {
-        logger.warn({ err }, 'TTS failed, falling back to text')
-      }
-    }
-
-    // Text reply
-    const formatted = formatForTelegram(responseText)
-    const chunks = splitMessage(formatted)
-    for (const chunk of chunks) {
-      await ctx.reply(chunk, { parse_mode: 'HTML' })
-    }
-  } catch (err) {
-    typingActive = false
-    clearInterval(typingInterval)
-    logger.error({ err }, 'handleMessage error')
-    await ctx.reply(`Error: ${String(err)}`)
-  }
-}
-
-// ── Bot factory ───────────────────────────────────────────────────────────────
-
-export function createBot(): Bot {
-  if (!TELEGRAM_BOT_TOKEN) {
-    throw new Error('TELEGRAM_BOT_TOKEN not set. Run `npm run setup` first.')
   }
 
-  const bot = new Bot(TELEGRAM_BOT_TOKEN)
+  if (newSessionId && newSessionId !== existingSessionId) {
+    setSession(chatId, newSessionId);
+  }
 
-  // ── Commands ────────────────────────────────────────────────────────────────
+  await saveConversationTurn(chatId, rawText, resultText);
 
-  bot.command('start', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    await ctx.reply(
-      '<b>ClaudeClaw</b> is running.\n\n' +
-      'Send any message to talk to Claude Code.\n\n' +
-      'Commands:\n' +
-      '/chatid — show your chat ID\n' +
-      '/newchat — start fresh conversation\n' +
-      '/memory — show recent memories\n' +
-      '/voice — toggle voice replies\n' +
-      '/schedule — manage scheduled tasks\n' +
-      '/wa — WhatsApp bridge\n' +
-      '/help — show this message',
-      { parse_mode: 'HTML' }
-    )
-  })
+  const ttsAvailable = voiceCapabilities().tts;
+  const useVoice =
+    ttsAvailable && (forceVoiceReply || voiceModeChats.has(chatId));
 
-  bot.command('help', async (ctx) => {
-    await ctx.reply(
-      '<b>ClaudeClaw Commands</b>\n\n' +
-      '/chatid — show your chat ID\n' +
-      '/newchat — start fresh conversation\n' +
-      '/forget — alias for /newchat\n' +
-      '/memory — show recent memories\n' +
-      '/voice — toggle voice mode on/off\n' +
-      '/schedule — manage scheduled tasks\n' +
-      '/wa — WhatsApp bridge\n\n' +
-      'Send any text, voice note, photo, or document.',
-      { parse_mode: 'HTML' }
-    )
-  })
-
-  bot.command('chatid', async (ctx) => {
-    await ctx.reply(`Your chat ID: <code>${ctx.chat?.id}</code>`, { parse_mode: 'HTML' })
-  })
-
-  bot.command('newchat', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    clearSession(chatId)
-    await ctx.reply('Session cleared. Starting fresh.')
-  })
-
-  bot.command('forget', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    clearSession(chatId)
-    await ctx.reply('Session cleared. Starting fresh.')
-  })
-
-  bot.command('memory', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    const memories = getMemoriesForChat(chatId, 10)
-    if (memories.length === 0) {
-      await ctx.reply('No memories stored yet.')
-      return
-    }
-    const lines = memories.map(m =>
-      `[${m.sector}] ${m.content.slice(0, 100)}${m.content.length > 100 ? '...' : ''} (salience: ${m.salience.toFixed(2)})`
-    )
-    await ctx.reply(`<b>Recent memories:</b>\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML' })
-  })
-
-  bot.command('voice', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    const caps = voiceCapabilities()
-    if (!caps.tts) {
-      await ctx.reply('TTS not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID in .env')
-      return
-    }
-    if (voiceModeChats.has(chatId)) {
-      voiceModeChats.delete(chatId)
-      await ctx.reply('Voice mode OFF — replies will be text.')
-    } else {
-      voiceModeChats.add(chatId)
-      await ctx.reply('Voice mode ON — replies will be audio.')
-    }
-  })
-
-  bot.command('schedule', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    const text = ctx.message?.text ?? ''
-    const parts = text.split(' ').slice(1)
-    await handleMessage(ctx, `Manage my scheduled tasks. Command: schedule ${parts.join(' ')}`, false)
-  })
-
-  bot.command('wa', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    await handleMessage(ctx, 'Show me my recent WhatsApp chats and their unread counts.', false)
-  })
-
-  // ── Message handlers ────────────────────────────────────────────────────────
-
-  bot.on('message:text', async (ctx) => {
-    const text = ctx.message.text
-    if (text.startsWith('/')) return // skip unknown commands
-    await handleMessage(ctx, text)
-  })
-
-  bot.on('message:voice', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    const caps = voiceCapabilities()
-    if (!caps.stt) {
-      await ctx.reply('Voice transcription not configured. Set GROQ_API_KEY in .env')
-      return
-    }
-    await ctx.api.sendChatAction(Number(chatId), 'typing')
+  if (useVoice) {
     try {
-      const fileId = ctx.message.voice.file_id
-      const localPath = await downloadMedia(TELEGRAM_BOT_TOKEN, fileId, 'voice.oga')
-      const transcript = await transcribeAudio(localPath)
-      await handleMessage(ctx, `[Voice transcribed]: ${transcript}`, true)
+      const audioBuffer = await synthesizeSpeech(resultText);
+      const tmpPath = path.join(UPLOADS_DIR, `voice_${Date.now()}.ogg`);
+      writeFileSync(tmpPath, audioBuffer);
+      await ctx.replyWithAudio(new InputFile(tmpPath));
+      return;
     } catch (err) {
-      logger.error({ err }, 'Voice handling error')
-      await ctx.reply(`Voice transcription failed: ${String(err)}`)
+      logger.warn({ err }, "TTS failed, falling back to text");
     }
-  })
+  }
 
-  bot.on('message:photo', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    await ctx.api.sendChatAction(Number(chatId), 'upload_photo')
-    try {
-      const photos = ctx.message.photo
-      const largest = photos[photos.length - 1]
-      const localPath = await downloadMedia(TELEGRAM_BOT_TOKEN, largest.file_id, 'photo.jpg')
-      const caption = ctx.message.caption
-      const prompt = buildPhotoMessage(localPath, caption)
-      await handleMessage(ctx, prompt)
-    } catch (err) {
-      logger.error({ err }, 'Photo handling error')
-      await ctx.reply(`Photo handling failed: ${String(err)}`)
-    }
-  })
+  const formatted = formatForTelegram(resultText);
+  const chunks = splitMessage(formatted);
 
-  bot.on('message:document', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    await ctx.api.sendChatAction(Number(chatId), 'upload_document')
-    try {
-      const doc = ctx.message.document
-      const localPath = await downloadMedia(TELEGRAM_BOT_TOKEN, doc.file_id, doc.file_name)
-      const caption = ctx.message.caption
-      const prompt = buildDocumentMessage(localPath, doc.file_name ?? 'document', caption)
-      await handleMessage(ctx, prompt)
-    } catch (err) {
-      logger.error({ err }, 'Document handling error')
-      await ctx.reply(`Document handling failed: ${String(err)}`)
-    }
-  })
-
-  bot.on('message:video', async (ctx) => {
-    const chatId = String(ctx.chat?.id)
-    if (!isAuthorised(chatId)) return
-    await ctx.api.sendChatAction(Number(chatId), 'upload_video')
-    try {
-      const video = ctx.message.video
-      const localPath = await downloadMedia(TELEGRAM_BOT_TOKEN, video.file_id, 'video.mp4')
-      const caption = ctx.message.caption
-      const prompt = buildVideoMessage(localPath, caption)
-      await handleMessage(ctx, prompt)
-    } catch (err) {
-      logger.error({ err }, 'Video handling error')
-      await ctx.reply(`Video handling failed: ${String(err)}`)
-    }
-  })
-
-  // Error handler
-  bot.catch((err) => {
-    logger.error({ err: err.error, ctx: err.ctx?.chat?.id }, 'Bot error')
-  })
-
-  return bot
-}
-
-/**
- * Send a message to a chat (used by scheduler).
- */
-export async function sendMessage(bot: Bot, chatId: string, text: string): Promise<void> {
-  const formatted = formatForTelegram(text)
-  const chunks = splitMessage(formatted)
   for (const chunk of chunks) {
     try {
-      await bot.api.sendMessage(Number(chatId), chunk, { parse_mode: 'HTML' })
+      await ctx.reply(chunk, { parse_mode: "HTML" });
     } catch {
-      // Fallback: send as plain text
-      await bot.api.sendMessage(Number(chatId), chunk)
+      await ctx.reply(chunk);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// sendMessage (used by scheduler)
+// ---------------------------------------------------------------------------
+
+export async function sendMessage(
+  bot: Bot,
+  chatId: string,
+  text: string,
+): Promise<void> {
+  const formatted = formatForTelegram(text);
+  const chunks = splitMessage(formatted);
+
+  for (const chunk of chunks) {
+    try {
+      await bot.api.sendMessage(Number(chatId), chunk, { parse_mode: "HTML" });
+    } catch {
+      try {
+        await bot.api.sendMessage(Number(chatId), chunk);
+      } catch (err) {
+        logger.error({ err, chatId }, "Failed to send message");
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// createBot
+// ---------------------------------------------------------------------------
+
+export function createBot(): Bot {
+  const bot = new Bot(TELEGRAM_BOT_TOKEN);
+
+  // /start
+  bot.command("start", async (ctx) => {
+    await ctx.reply(`Hey. I'm your personal AI assistant.\n\n${COMMANDS_LIST}`);
+  });
+
+  // /help
+  bot.command("help", async (ctx) => {
+    await ctx.reply(COMMANDS_LIST);
+  });
+
+  // /chatid
+  bot.command("chatid", async (ctx) => {
+    await ctx.reply(`Your chat ID: ${ctx.chat?.id}`);
+  });
+
+  // /newchat, /forget
+  bot.command(["newchat", "forget"], async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+    clearSession(chatId);
+    await ctx.reply("Session cleared.");
+  });
+
+  // /memory
+  bot.command("memory", async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+
+    if (!isAuthorised(chatId)) {
+      await ctx.reply("Not authorised.");
+      return;
+    }
+
+    const memories = getMemoriesForChat(chatId, 10);
+
+    if (memories.length === 0) {
+      await ctx.reply("No memories saved yet.");
+      return;
+    }
+
+    const lines = memories.map((m, i) => {
+      const date = new Date(m.accessed_at).toLocaleDateString();
+      return `${i + 1}. [${m.sector}] ${m.content.slice(0, 120)} (${date})`;
+    });
+
+    await ctx.reply(lines.join("\n\n"));
+  });
+
+  // /voice
+  bot.command("voice", async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+
+    if (!isAuthorised(chatId)) {
+      await ctx.reply("Not authorised.");
+      return;
+    }
+
+    if (!voiceCapabilities().tts) {
+      await ctx.reply(
+        "Voice not available (no ElevenLabs API key configured).",
+      );
+      return;
+    }
+
+    if (voiceModeChats.has(chatId)) {
+      voiceModeChats.delete(chatId);
+      await ctx.reply("Voice mode off.");
+    } else {
+      voiceModeChats.add(chatId);
+      await ctx.reply("Voice mode on.");
+    }
+  });
+
+  // /schedule
+  bot.command("schedule", async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+
+    if (!isAuthorised(chatId)) {
+      await ctx.reply("Not authorised.");
+      return;
+    }
+
+    const text = ctx.message?.text ?? "";
+    const parts = text.split(/\s+/).slice(1); // drop /schedule
+    const sub = parts[0];
+
+    if (!sub || sub === "list") {
+      const tasks = getAllTasks(chatId);
+
+      if (tasks.length === 0) {
+        await ctx.reply("No scheduled tasks.");
+        return;
+      }
+
+      const lines = tasks.map((t) => {
+        const next = t.next_run
+          ? new Date(t.next_run * 1000).toLocaleString()
+          : "n/a";
+        return `ID: ${t.id.slice(0, 8)}\nPrompt: ${t.prompt.slice(0, 60)}\nCron: ${t.schedule}\nStatus: ${t.status}\nNext: ${next}`;
+      });
+
+      await ctx.reply(lines.join("\n\n---\n\n"));
+      return;
+    }
+
+    if (sub === "create") {
+      // /schedule create <cron_field1> <cron_field2> <cron_field3> <cron_field4> <cron_field5> <prompt...>
+      // We expect: cron is 5 space-separated fields, then rest is prompt
+      // parts[1..5] = cron fields, parts[6..] = prompt
+      if (parts.length < 7) {
+        await ctx.reply(
+          "Usage: /schedule create <cron 5-fields> <prompt...>\nExample: /schedule create 0 9 * * * Good morning briefing",
+        );
+        return;
+      }
+
+      const cronFields = parts.slice(1, 6).join(" ");
+      const prompt = parts.slice(6).join(" ");
+
+      try {
+        const { parseExpression } = await import("cron-parser");
+        parseExpression(cronFields);
+      } catch {
+        await ctx.reply(`Invalid cron expression: "${cronFields}"`);
+        return;
+      }
+
+      const id = randomUUID();
+      const nextRun = computeNextRun(cronFields);
+      const now = Math.floor(Date.now() / 1000);
+
+      createTask({
+        id,
+        chat_id: chatId,
+        prompt,
+        schedule: cronFields,
+        next_run: nextRun,
+        status: "active",
+        created_at: now,
+      });
+
+      const next = new Date(nextRun * 1000).toLocaleString();
+      await ctx.reply(`Task created: ${id.slice(0, 8)}\nNext run: ${next}`);
+      return;
+    }
+
+    if (sub === "delete") {
+      const id = parts[1];
+      if (!id) {
+        await ctx.reply("Usage: /schedule delete <id>");
+        return;
+      }
+      deleteTask(id);
+      await ctx.reply(`Deleted: ${id}`);
+      return;
+    }
+
+    if (sub === "pause") {
+      const id = parts[1];
+      if (!id) {
+        await ctx.reply("Usage: /schedule pause <id>");
+        return;
+      }
+      setTaskStatus(id, "paused");
+      await ctx.reply(`Paused: ${id}`);
+      return;
+    }
+
+    if (sub === "resume") {
+      const id = parts[1];
+      if (!id) {
+        await ctx.reply("Usage: /schedule resume <id>");
+        return;
+      }
+      setTaskStatus(id, "active");
+      await ctx.reply(`Resumed: ${id}`);
+      return;
+    }
+
+    await ctx.reply("Unknown schedule command. Try /schedule list.");
+  });
+
+  // Text messages
+  bot.on("message:text", async (ctx) => {
+    const text = ctx.message.text;
+    if (text.startsWith("/")) return; // already handled by command handlers
+    await handleMessage(ctx, text);
+  });
+
+  // Voice messages
+  bot.on("message:voice", async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+
+    if (!isAuthorised(chatId)) {
+      await ctx.reply("Not authorised.");
+      return;
+    }
+
+    if (!voiceCapabilities().stt) {
+      await ctx.reply("Voice transcription not available.");
+      return;
+    }
+
+    try {
+      const fileId = ctx.message.voice.file_id;
+      const ogaPath = await downloadMedia(fileId, "voice.oga");
+      const oggPath = ogaPath.replace(/\.oga$/, ".ogg");
+
+      const { renameSync } = await import("fs");
+      renameSync(ogaPath, oggPath);
+
+      const transcription = await transcribeAudio(oggPath);
+      const prefixed = `[Voice transcribed]: ${transcription}`;
+
+      await handleMessage(ctx, prefixed, true);
+    } catch (err) {
+      logger.error({ err }, "Voice message handling failed");
+      await ctx.reply("Failed to process voice message.");
+    }
+  });
+
+  // Photo messages
+  bot.on("message:photo", async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+
+    if (!isAuthorised(chatId)) {
+      await ctx.reply("Not authorised.");
+      return;
+    }
+
+    try {
+      const photos = ctx.message.photo;
+      const largest = photos[photos.length - 1];
+      const localPath = await downloadMedia(largest.file_id, "photo.jpg");
+      const caption = ctx.message.caption ?? "";
+      const messageText = buildPhotoMessage(localPath, caption);
+      await handleMessage(ctx, messageText);
+    } catch (err) {
+      logger.error({ err }, "Photo handling failed");
+      await ctx.reply("Failed to process photo.");
+    }
+  });
+
+  // Document messages
+  bot.on("message:document", async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+
+    if (!isAuthorised(chatId)) {
+      await ctx.reply("Not authorised.");
+      return;
+    }
+
+    try {
+      const doc = ctx.message.document;
+      const localPath = await downloadMedia(
+        doc.file_id,
+        doc.file_name ?? "document",
+      );
+      const caption = ctx.message.caption ?? "";
+      const messageText = buildDocumentMessage(
+        localPath,
+        doc.file_name ?? "document",
+        caption,
+      );
+      await handleMessage(ctx, messageText);
+    } catch (err) {
+      logger.error({ err }, "Document handling failed");
+      await ctx.reply("Failed to process document.");
+    }
+  });
+
+  // Video messages
+  bot.on("message:video", async (ctx) => {
+    const chatId = String(ctx.chat?.id ?? "");
+
+    if (!isAuthorised(chatId)) {
+      await ctx.reply("Not authorised.");
+      return;
+    }
+
+    try {
+      const video = ctx.message.video;
+      const localPath = await downloadMedia(video.file_id, "video.mp4");
+      const caption = ctx.message.caption ?? "";
+      const messageText = buildVideoMessage(localPath, caption);
+      await handleMessage(ctx, messageText);
+    } catch (err) {
+      logger.error({ err }, "Video handling failed");
+      await ctx.reply("Failed to process video.");
+    }
+  });
+
+  return bot;
 }

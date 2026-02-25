@@ -1,32 +1,86 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "fs";
-import { fileURLToPath } from "url";
-import path from "path";
+import { DatabaseSync } from 'node:sqlite'
+import { mkdirSync } from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, "..");
-const STORE_DIR = path.join(PROJECT_ROOT, "store");
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const STORE_DIR = path.resolve(__dirname, '..', 'store')
+const DB_PATH = path.join(STORE_DIR, 'claudeclaw.db')
 
-mkdirSync(STORE_DIR, { recursive: true });
+mkdirSync(STORE_DIR, { recursive: true })
 
-const DB_PATH = path.join(STORE_DIR, "claudeclaw.db");
-export const db = new DatabaseSync(DB_PATH);
+const db = new DatabaseSync(DB_PATH)
 
-db.exec("PRAGMA journal_mode = WAL");
-db.exec("PRAGMA foreign_keys = ON");
+db.exec('PRAGMA journal_mode=WAL')
+db.exec('PRAGMA foreign_keys=ON')
 
-// ── Schema ────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Interfaces
+// ---------------------------------------------------------------------------
+
+export interface Memory {
+  id: number
+  chat_id: string
+  topic_key: string | null
+  content: string
+  sector: 'semantic' | 'episodic'
+  salience: number
+  created_at: number
+  accessed_at: number
+}
+
+export interface Turn {
+  id: number
+  chat_id: string
+  role: 'user' | 'assistant'
+  content: string
+  created_at: number
+}
+
+export interface ScheduledTask {
+  id: string
+  chat_id: string
+  prompt: string
+  schedule: string
+  next_run: number
+  last_run: number | null
+  last_result: string | null
+  status: 'active' | 'paused'
+  created_at: number
+}
+
+export interface WaMessage {
+  id: string
+  chat_jid: string
+  from_me: number
+  body: string
+  timestamp: number
+  notified: number
+}
+
+export interface WaOutbox {
+  id: number
+  chat_jid: string
+  message: string
+  created_at: number
+  sent_at: number | null
+  status: 'pending' | 'sent' | 'failed'
+}
+
+// ---------------------------------------------------------------------------
+// Schema initialization
+// ---------------------------------------------------------------------------
 
 export function initDatabase(): void {
   db.exec(`
-    -- Sessions: maps chat_id → claude session_id
     CREATE TABLE IF NOT EXISTS sessions (
       chat_id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       updated_at INTEGER NOT NULL
-    );
+    )
+  `)
 
-    -- Full memory: dual-sector salience decay model
+  db.exec(`
     CREATE TABLE IF NOT EXISTS memories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id TEXT NOT NULL,
@@ -36,38 +90,44 @@ export function initDatabase(): void {
       salience REAL NOT NULL DEFAULT 1.0,
       created_at INTEGER NOT NULL,
       accessed_at INTEGER NOT NULL
-    );
+    )
+  `)
 
-    -- FTS5 virtual table for full-text search on memories
+  db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-      USING fts5(content, content='memories', content_rowid='id');
+      USING fts5(content, content='memories', content_rowid='id')
+  `)
 
-    -- Triggers to keep FTS in sync with memories table
+  db.exec(`
     CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
       INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
-    END;
+    END
+  `)
 
+  db.exec(`
     CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, content)
-        VALUES ('delete', old.id, old.content);
-    END;
+      INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    END
+  `)
 
+  db.exec(`
     CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, content)
-        VALUES ('delete', old.id, old.content);
+      INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
       INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
-    END;
+    END
+  `)
 
-    -- Simple conversation turns (fallback memory)
+  db.exec(`
     CREATE TABLE IF NOT EXISTS turns (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id TEXT NOT NULL,
       role TEXT NOT NULL CHECK(role IN ('user','assistant')),
       content TEXT NOT NULL,
       created_at INTEGER NOT NULL
-    );
+    )
+  `)
 
-    -- Scheduled tasks
+  db.exec(`
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
       chat_id TEXT NOT NULL,
@@ -78,10 +138,14 @@ export function initDatabase(): void {
       last_result TEXT,
       status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused')),
       created_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_tasks_status_next ON scheduled_tasks(status, next_run);
+    )
+  `)
 
-    -- WhatsApp outbox queue
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tasks_status_next ON scheduled_tasks(status, next_run)
+  `)
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS wa_outbox (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_jid TEXT NOT NULL,
@@ -89,9 +153,10 @@ export function initDatabase(): void {
       created_at INTEGER NOT NULL,
       sent_at INTEGER,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','failed'))
-    );
+    )
+  `)
 
-    -- WhatsApp incoming messages
+  db.exec(`
     CREATE TABLE IF NOT EXISTS wa_messages (
       id TEXT PRIMARY KEY,
       chat_jid TEXT NOT NULL,
@@ -99,321 +164,270 @@ export function initDatabase(): void {
       body TEXT NOT NULL,
       timestamp INTEGER NOT NULL,
       notified INTEGER NOT NULL DEFAULT 0
-    );
+    )
+  `)
 
-    -- WhatsApp message ID → Telegram message ID mapping (for replies)
+  db.exec(`
     CREATE TABLE IF NOT EXISTS wa_message_map (
       wa_id TEXT PRIMARY KEY,
       tg_msg_id INTEGER NOT NULL,
       chat_jid TEXT NOT NULL,
       created_at INTEGER NOT NULL
-    );
-  `);
+    )
+  `)
 }
 
-// ── Sessions ──────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
 
-export function getSession(chatId: string): string | undefined {
-  const row = db
-    .prepare("SELECT session_id FROM sessions WHERE chat_id = ?")
-    .get(chatId) as unknown as { session_id: string } | undefined;
-  return row?.session_id;
+export function getSession(chatId: string): string | null {
+  const stmt = db.prepare('SELECT session_id FROM sessions WHERE chat_id = ?')
+  const row = stmt.get(chatId) as { session_id: string } | undefined
+  return row ? row.session_id : null
 }
 
 export function setSession(chatId: string, sessionId: string): void {
-  db.prepare(
-    `
+  const stmt = db.prepare(`
     INSERT INTO sessions (chat_id, session_id, updated_at)
     VALUES (?, ?, ?)
     ON CONFLICT(chat_id) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at
-  `,
-  ).run(chatId, sessionId, Math.floor(Date.now() / 1000));
+  `)
+  stmt.run(chatId, sessionId, Date.now())
 }
 
 export function clearSession(chatId: string): void {
-  db.prepare("DELETE FROM sessions WHERE chat_id = ?").run(chatId);
+  const stmt = db.prepare('DELETE FROM sessions WHERE chat_id = ?')
+  stmt.run(chatId)
 }
 
-// ── Full Memory CRUD ──────────────────────────────────────────────────────────
-
-export interface Memory {
-  id: number;
-  chat_id: string;
-  topic_key: string | null;
-  content: string;
-  sector: "semantic" | "episodic";
-  salience: number;
-  created_at: number;
-  accessed_at: number;
-}
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
 
 export function insertMemory(
   chatId: string,
   content: string,
-  sector: "semantic" | "episodic",
-  topicKey?: string,
+  sector: 'semantic' | 'episodic',
+  topicKey?: string
 ): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `
+  const now = Date.now()
+  const stmt = db.prepare(`
     INSERT INTO memories (chat_id, topic_key, content, sector, salience, created_at, accessed_at)
     VALUES (?, ?, ?, ?, 1.0, ?, ?)
-  `,
-  ).run(chatId, topicKey ?? null, content, sector, now, now);
+  `)
+  stmt.run(chatId, topicKey ?? null, content, sector, now, now)
 }
 
-export function searchMemoriesFts(
-  chatId: string,
-  query: string,
-  limit = 3,
-): Memory[] {
-  return db
-    .prepare(
-      `
-    SELECT m.* FROM memories m
-    JOIN memories_fts f ON m.id = f.rowid
-    WHERE f.content MATCH ? AND m.chat_id = ?
-    ORDER BY rank
+export function searchMemoriesFts(chatId: string, query: string, limit = 3): Memory[] {
+  const stmt = db.prepare(`
+    SELECT m.*
+    FROM memories m
+    JOIN memories_fts fts ON m.id = fts.rowid
+    WHERE m.chat_id = ? AND memories_fts MATCH ?
+    ORDER BY fts.rank
     LIMIT ?
-  `,
-    )
-    .all(query, chatId, limit) as unknown as Memory[];
+  `)
+  return stmt.all(chatId, query, limit) as unknown as Memory[]
 }
 
 export function getRecentMemories(chatId: string, limit = 5): Memory[] {
-  return db
-    .prepare(
-      `
-    SELECT * FROM memories WHERE chat_id = ?
-    ORDER BY accessed_at DESC LIMIT ?
-  `,
-    )
-    .all(chatId, limit) as unknown as Memory[];
+  const stmt = db.prepare(`
+    SELECT * FROM memories
+    WHERE chat_id = ?
+    ORDER BY accessed_at DESC
+    LIMIT ?
+  `)
+  return stmt.all(chatId, limit) as unknown as Memory[]
 }
 
 export function touchMemory(id: number): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `
-    UPDATE memories SET accessed_at = ?, salience = MIN(salience + 0.1, 5.0) WHERE id = ?
-  `,
-  ).run(now, id);
+  const stmt = db.prepare(`
+    UPDATE memories
+    SET accessed_at = ?,
+        salience = MIN(salience + 0.1, 5.0)
+    WHERE id = ?
+  `)
+  stmt.run(Date.now(), id)
 }
 
 export function decayMemories(): void {
-  const cutoff = Math.floor(Date.now() / 1000) - 86400;
-  db.prepare(
-    `
-    UPDATE memories SET salience = salience * 0.98 WHERE created_at < ?
-  `,
-  ).run(cutoff);
-  db.prepare(`DELETE FROM memories WHERE salience < 0.1`).run();
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
+
+  const decayStmt = db.prepare(`
+    UPDATE memories
+    SET salience = salience * 0.98
+    WHERE accessed_at < ?
+  `)
+  decayStmt.run(sevenDaysAgo)
+
+  const deleteStmt = db.prepare('DELETE FROM memories WHERE salience < 0.1')
+  deleteStmt.run()
 }
 
 export function getMemoriesForChat(chatId: string, limit = 20): Memory[] {
-  return db
-    .prepare(
-      `
-    SELECT * FROM memories WHERE chat_id = ? ORDER BY accessed_at DESC LIMIT ?
-  `,
-    )
-    .all(chatId, limit) as unknown as Memory[];
+  const stmt = db.prepare(`
+    SELECT * FROM memories
+    WHERE chat_id = ?
+    ORDER BY salience DESC, accessed_at DESC
+    LIMIT ?
+  `)
+  return stmt.all(chatId, limit) as unknown as Memory[]
 }
 
-// ── Simple Turns ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Turns
+// ---------------------------------------------------------------------------
 
-export interface Turn {
-  id: number;
-  chat_id: string;
-  role: "user" | "assistant";
-  content: string;
-  created_at: number;
-}
-
-export function insertTurn(
-  chatId: string,
-  role: "user" | "assistant",
-  content: string,
-): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `
-    INSERT INTO turns (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)
-  `,
-  ).run(chatId, role, content, now);
+export function insertTurn(chatId: string, role: 'user' | 'assistant', content: string): void {
+  const stmt = db.prepare(`
+    INSERT INTO turns (chat_id, role, content, created_at)
+    VALUES (?, ?, ?, ?)
+  `)
+  stmt.run(chatId, role, content, Date.now())
 }
 
 export function getRecentTurns(chatId: string, limit = 10): Turn[] {
-  return db
-    .prepare(
-      `
-    SELECT * FROM turns WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?
-  `,
-    )
-    .all(chatId, limit)
-    .reverse() as unknown as Turn[];
+  const stmt = db.prepare(`
+    SELECT * FROM (
+      SELECT * FROM turns
+      WHERE chat_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    ) ORDER BY created_at ASC
+  `)
+  return stmt.all(chatId, limit) as unknown as Turn[]
 }
 
 export function pruneOldTurns(chatId: string, keep = 50): void {
-  db.prepare(
-    `
-    DELETE FROM turns WHERE chat_id = ? AND id NOT IN (
-      SELECT id FROM turns WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?
-    )
-  `,
-  ).run(chatId, chatId, keep);
+  const stmt = db.prepare(`
+    DELETE FROM turns
+    WHERE chat_id = ?
+      AND id NOT IN (
+        SELECT id FROM turns
+        WHERE chat_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      )
+  `)
+  stmt.run(chatId, chatId, keep)
 }
 
-// ── Scheduled Tasks ───────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
 
-export interface ScheduledTask {
-  id: string;
-  chat_id: string;
-  prompt: string;
-  schedule: string;
-  next_run: number;
-  last_run: number | null;
-  last_result: string | null;
-  status: "active" | "paused";
-  created_at: number;
+export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>): void {
+  const stmt = db.prepare(`
+    INSERT INTO scheduled_tasks (id, chat_id, prompt, schedule, next_run, last_run, last_result, status, created_at)
+    VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+  `)
+  stmt.run(task.id, task.chat_id, task.prompt, task.schedule, task.next_run, task.status, task.created_at)
 }
 
-export function createTask(
-  task: Omit<ScheduledTask, "last_run" | "last_result">,
-): void {
-  db.prepare(
-    `
-    INSERT INTO scheduled_tasks (id, chat_id, prompt, schedule, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `,
-  ).run(
-    task.id,
-    task.chat_id,
-    task.prompt,
-    task.schedule,
-    task.next_run,
-    task.status,
-    task.created_at,
-  );
+export function getDueTasks(now: number): ScheduledTask[] {
+  const stmt = db.prepare(`
+    SELECT * FROM scheduled_tasks
+    WHERE status = 'active' AND next_run <= ?
+    ORDER BY next_run ASC
+  `)
+  return stmt.all(now) as unknown as ScheduledTask[]
 }
 
-export function getDueTasks(): ScheduledTask[] {
-  const now = Math.floor(Date.now() / 1000);
-  return db
-    .prepare(
-      `
-    SELECT * FROM scheduled_tasks WHERE status = 'active' AND next_run <= ?
-  `,
-    )
-    .all(now) as unknown as ScheduledTask[];
-}
-
-export function getAllTasks(): ScheduledTask[] {
-  return db
-    .prepare("SELECT * FROM scheduled_tasks ORDER BY created_at DESC")
-    .all() as unknown as ScheduledTask[];
+export function getAllTasks(chatId?: string): ScheduledTask[] {
+  if (chatId !== undefined) {
+    const stmt = db.prepare(`
+      SELECT * FROM scheduled_tasks
+      WHERE chat_id = ?
+      ORDER BY created_at DESC
+    `)
+    return stmt.all(chatId) as unknown as ScheduledTask[]
+  }
+  const stmt = db.prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC')
+  return stmt.all() as unknown as ScheduledTask[]
 }
 
 export function updateTaskAfterRun(
   id: string,
-  result: string,
+  lastRun: number,
   nextRun: number,
+  lastResult: string
 ): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `
-    UPDATE scheduled_tasks SET last_run = ?, last_result = ?, next_run = ? WHERE id = ?
-  `,
-  ).run(now, result.slice(0, 500), nextRun, id);
+  const stmt = db.prepare(`
+    UPDATE scheduled_tasks
+    SET last_run = ?, next_run = ?, last_result = ?
+    WHERE id = ?
+  `)
+  stmt.run(lastRun, nextRun, lastResult, id)
 }
 
-export function setTaskStatus(id: string, status: "active" | "paused"): void {
-  db.prepare("UPDATE scheduled_tasks SET status = ? WHERE id = ?").run(
-    status,
-    id,
-  );
+export function setTaskStatus(id: string, status: 'active' | 'paused'): void {
+  const stmt = db.prepare('UPDATE scheduled_tasks SET status = ? WHERE id = ?')
+  stmt.run(status, id)
 }
 
 export function deleteTask(id: string): void {
-  db.prepare("DELETE FROM scheduled_tasks WHERE id = ?").run(id);
+  const stmt = db.prepare('DELETE FROM scheduled_tasks WHERE id = ?')
+  stmt.run(id)
 }
 
-// ── WhatsApp ──────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// WhatsApp incoming
+// ---------------------------------------------------------------------------
 
-export interface WaMessage {
-  id: string;
-  chat_jid: string;
-  from_me: number;
-  body: string;
-  timestamp: number;
-  notified: number;
-}
-
-export function insertWaMessage(msg: WaMessage): void {
-  db.prepare(
-    `
+export function insertWaMessage(msg: Omit<WaMessage, 'notified'>): void {
+  const stmt = db.prepare(`
     INSERT OR IGNORE INTO wa_messages (id, chat_jid, from_me, body, timestamp, notified)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.from_me,
-    msg.body,
-    msg.timestamp,
-    msg.notified,
-  );
+    VALUES (?, ?, ?, ?, ?, 0)
+  `)
+  stmt.run(msg.id, msg.chat_jid, msg.from_me, msg.body, msg.timestamp)
 }
 
 export function getUnnotifiedWaMessages(): WaMessage[] {
-  return db
-    .prepare(
-      `
-    SELECT * FROM wa_messages WHERE notified = 0 ORDER BY timestamp ASC LIMIT 10
-  `,
-    )
-    .all() as unknown as WaMessage[];
+  const stmt = db.prepare(`
+    SELECT * FROM wa_messages
+    WHERE notified = 0
+    ORDER BY timestamp ASC
+  `)
+  return stmt.all() as unknown as WaMessage[]
 }
 
 export function markWaMessageNotified(id: string): void {
-  db.prepare("UPDATE wa_messages SET notified = 1 WHERE id = ?").run(id);
+  const stmt = db.prepare('UPDATE wa_messages SET notified = 1 WHERE id = ?')
+  stmt.run(id)
 }
 
-export interface WaOutbox {
-  id?: number;
-  chat_jid: string;
-  message: string;
-  created_at: number;
-  sent_at?: number;
-  status: "pending" | "sent" | "failed";
-}
+// ---------------------------------------------------------------------------
+// WhatsApp outbox
+// ---------------------------------------------------------------------------
 
 export function queueWaOutbox(chatJid: string, message: string): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `
-    INSERT INTO wa_outbox (chat_jid, message, created_at, status) VALUES (?, ?, ?, 'pending')
-  `,
-  ).run(chatJid, message, now);
+  const stmt = db.prepare(`
+    INSERT INTO wa_outbox (chat_jid, message, created_at, sent_at, status)
+    VALUES (?, ?, ?, NULL, 'pending')
+  `)
+  stmt.run(chatJid, message, Date.now())
 }
 
 export function getPendingWaOutbox(): WaOutbox[] {
-  return db
-    .prepare(
-      `
-    SELECT * FROM wa_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT 10
-  `,
-    )
-    .all() as unknown as WaOutbox[];
+  const stmt = db.prepare(`
+    SELECT * FROM wa_outbox
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+  `)
+  return stmt.all() as unknown as WaOutbox[]
 }
 
 export function markWaOutboxSent(id: number): void {
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `UPDATE wa_outbox SET status = 'sent', sent_at = ? WHERE id = ?`,
-  ).run(now, id);
+  const stmt = db.prepare(`
+    UPDATE wa_outbox SET status = 'sent', sent_at = ? WHERE id = ?
+  `)
+  stmt.run(Date.now(), id)
 }
 
 export function markWaOutboxFailed(id: number): void {
-  db.prepare(`UPDATE wa_outbox SET status = 'failed' WHERE id = ?`).run(id);
+  const stmt = db.prepare(`
+    UPDATE wa_outbox SET status = 'failed' WHERE id = ?
+  `)
+  stmt.run(id)
 }

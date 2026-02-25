@@ -1,9 +1,8 @@
-import pino from "pino";
-
+import pinoModule from "pino";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const pinoFn = (pino as any).default ?? pino;
+const pino = (pinoModule as any).default ?? pinoModule;
 
-export const logger = pinoFn({
+export const logger = pino({
   level: process.env.LOG_LEVEL ?? "info",
   transport:
     process.env.NODE_ENV !== "production"

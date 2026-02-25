@@ -1,56 +1,64 @@
-import { insertMemory, searchMemoriesFts, getRecentMemories, touchMemory, decayMemories as dbDecay } from './db.js'
+import {
+  insertMemory,
+  searchMemoriesFts,
+  getRecentMemories,
+  touchMemory,
+  decayMemories as dbDecay,
+} from './db.js'
 import { logger } from './logger.js'
 
-const SEMANTIC_PATTERN = /\b(my|i am|i'm|i prefer|remember|always|never|i like|i hate|i use|i work)\b/i
+const SEMANTIC_TRIGGERS =
+  /\b(my|i am|i'm|i prefer|remember|always|never|i like|i hate|i use|i work|i need|i want)\b/i
 
-/**
- * Build a memory context string to prepend to user messages.
- * Searches FTS5 index and recent memories, deduplicates, and returns formatted context.
- */
-export async function buildMemoryContext(chatId: string, userMessage: string): Promise<string> {
-  try {
-    // Sanitize query for FTS5 — strip non-alphanumeric, add * for prefix search
-    const sanitized = userMessage
-      .replace(/[^a-zA-Z0-9\s]/g, ' ')
-      .trim()
-      .split(/\s+/)
-      .filter(w => w.length > 2)
-      .slice(0, 5)
-      .join(' OR ')
+export async function buildMemoryContext(
+  chatId: string,
+  userMessage: string
+): Promise<string> {
+  // Sanitize query: strip non-alphanum, split words >2 chars, take first 5, join with ' OR ', add '*'
+  const sanitized = userMessage.replace(/[^a-zA-Z0-9\s]/g, ' ')
+  const words = sanitized
+    .split(/\s+/)
+    .filter(w => w.length > 2)
+    .slice(0, 5)
 
-    const ftsResults = sanitized
-      ? searchMemoriesFts(chatId, sanitized + '*', 3)
-      : []
+  const memories: Array<{ id: number; content: string; sector: string }> = []
 
-    const recentResults = getRecentMemories(chatId, 5)
-
-    // Deduplicate by id
-    const seen = new Set<number>()
-    const combined = [...ftsResults, ...recentResults].filter(m => {
-      if (seen.has(m.id)) return false
-      seen.add(m.id)
-      return true
-    })
-
-    if (combined.length === 0) return ''
-
-    // Touch each memory to reinforce salience
-    for (const m of combined) {
-      touchMemory(m.id)
+  if (words.length > 0) {
+    const ftsQuery = words.map(w => `${w}*`).join(' OR ')
+    try {
+      const ftsResults = searchMemoriesFts(chatId, ftsQuery, 3)
+      memories.push(...ftsResults)
+    } catch (err) {
+      logger.warn({ err }, 'FTS search failed, skipping')
     }
-
-    const lines = combined.map(m => `- ${m.content} (${m.sector})`)
-    return `[Memory context]\n${lines.join('\n')}`
-  } catch (err) {
-    logger.warn({ err }, 'buildMemoryContext error — skipping')
-    return ''
   }
+
+  const recentResults = getRecentMemories(chatId, 5)
+
+  // Deduplicate by id
+  const seen = new Set<number>()
+  for (const m of memories) seen.add(m.id)
+  for (const m of recentResults) {
+    if (!seen.has(m.id)) {
+      seen.add(m.id)
+      memories.push(m)
+    }
+  }
+
+  if (memories.length === 0) return ''
+
+  // Touch each to reinforce salience
+  for (const m of memories) {
+    touchMemory(m.id)
+  }
+
+  const lines = memories
+    .map(m => `- ${m.content} (${m.sector})`)
+    .join('\n')
+
+  return `[Memory context]\n${lines}`
 }
 
-/**
- * Save a conversation turn to the memory store.
- * Classifies as semantic or episodic based on content.
- */
 export async function saveConversationTurn(
   chatId: string,
   userMsg: string,
@@ -58,23 +66,20 @@ export async function saveConversationTurn(
 ): Promise<void> {
   if (userMsg.length <= 20 || userMsg.startsWith('/')) return
 
-  try {
-    const sector = SEMANTIC_PATTERN.test(userMsg) ? 'semantic' : 'episodic'
-    const content = `User: ${userMsg.slice(0, 200)}\nAssistant: ${assistantMsg.slice(0, 200)}`
-    insertMemory(chatId, content, sector)
-  } catch (err) {
-    logger.warn({ err }, 'saveConversationTurn error')
-  }
+  const sector: 'semantic' | 'episodic' = SEMANTIC_TRIGGERS.test(userMsg)
+    ? 'semantic'
+    : 'episodic'
+
+  const content = `User: ${userMsg.slice(0, 200)}\nAssistant: ${assistantMsg.slice(0, 200)}`
+
+  insertMemory(chatId, content, sector)
 }
 
-/**
- * Run the salience decay sweep. Call this daily.
- */
 export function runDecaySweep(): void {
   try {
     dbDecay()
-    logger.debug('Memory decay sweep complete')
+    logger.info('memory decay sweep completed')
   } catch (err) {
-    logger.warn({ err }, 'runDecaySweep error')
+    logger.error({ err }, 'memory decay sweep failed')
   }
 }
